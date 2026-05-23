@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inkplate Dev Console"
+  short_description: "Use Inkplate dev-console hardware loops."
+  default_prompt: "Use this skill when you need to observe, control, or debug an Inkplate device through inkplate-dev."
