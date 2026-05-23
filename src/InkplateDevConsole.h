@@ -41,6 +41,7 @@ class InkplateDevConsole {
 
   bool consumeTap(int& x, int& y);
   void queueTap(int x, int y);
+  bool hasPendingTap() const { return tapPending_; }
 
   bool keepAwake() const { return keepAwake_; }
   void setKeepAwake(bool enabled) { keepAwake_ = enabled; }
