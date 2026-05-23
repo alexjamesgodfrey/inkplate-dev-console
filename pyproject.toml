@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inkplate-dev-console"
+version = "0.1.0"
+description = "Python CLI and Arduino library for observing and controlling Inkplate dev firmware over serial."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Alex Godfrey" }]
+keywords = ["inkplate", "eink", "serial", "arduino", "esp32", "debug"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Embedded Systems",
+]
+dependencies = ["pyserial>=3.5"]
+
+[project.urls]
+Homepage = "https://github.com/alexjamesgodfrey/inkplate-dev-console"
+Repository = "https://github.com/alexjamesgodfrey/inkplate-dev-console"
+Issues = "https://github.com/alexjamesgodfrey/inkplate-dev-console/issues"
+
+[project.scripts]
+inkplate-dev = "inkplate_dev_console.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["python"]
