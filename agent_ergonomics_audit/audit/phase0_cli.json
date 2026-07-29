@@ -1,0 +1,18 @@
+{
+  "target_path": "/Users/alexgodfrey/Developer/inkplate-dev-console",
+  "discovered_at": "2026-07-29T16:53:06Z",
+  "languages": [
+    "python"
+  ],
+  "binaries": [
+    "inkplate-dev",
+    "where"
+  ],
+  "env_var_prefix": "",
+  "existing_surfaces": {
+    "robot_mode": false,
+    "capabilities": false,
+    "robot_docs": false
+  },
+  "recommended_mode": "full"
+}

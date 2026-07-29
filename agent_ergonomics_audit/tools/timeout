@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Small macOS-compatible subset of GNU timeout for the audit harness."""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+
+
+def main() -> int:
+    if len(sys.argv) < 3:
+        print("usage: timeout SECONDS COMMAND [ARG ...]", file=sys.stderr)
+        return 1
+
+    try:
+        seconds = float(sys.argv[1].removesuffix("s"))
+    except ValueError:
+        print(f"timeout: invalid duration: {sys.argv[1]}", file=sys.stderr)
+        return 1
+
+    try:
+        return subprocess.run(sys.argv[2:], timeout=seconds, check=False).returncode
+    except subprocess.TimeoutExpired:
+        return 124
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
