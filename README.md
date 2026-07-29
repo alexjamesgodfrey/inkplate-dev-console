@@ -23,6 +23,19 @@ inkplate-dev square e2
 inkplate-dev watch --out /tmp/inkplate.png --interval 1
 ```
 
+For the common agent loop, one command reads state and captures the screen
+through a single serial connection:
+
+```bash
+inkplate-dev snapshot --out /tmp/inkplate.png
+```
+
+If that fails, start with the local diagnostic:
+
+```bash
+inkplate-dev doctor --connect --json
+```
+
 ## Why
 
 E-paper devices are awkward to debug because the thing you need to inspect is the physical screen. Serial logs help, but they do not answer "what is currently visible?" or "did that tap do what I expected?"
@@ -33,6 +46,9 @@ This library turns the firmware into a small, explicit test surface:
 | --- | --- |
 | Inspect app state | `inkplate-dev state` |
 | Capture screen pixels | `inkplate-dev frame --out screen.png` |
+| Read state and capture once | `inkplate-dev snapshot --out screen.png` |
+| Diagnose port and firmware | `inkplate-dev doctor --connect --json` |
+| Explain port selection | `inkplate-dev ports --json` |
 | Inject a physical coordinate | `inkplate-dev tap 120 310` |
 | Inject an app-specific target | `inkplate-dev square e2` |
 | Keep development builds awake | `inkplate-dev awake on` |
@@ -139,10 +155,14 @@ Run the CLI:
 
 ```bash
 inkplate-dev --port /dev/cu.usbserial-10 state
+inkplate-dev state --port /dev/cu.usbserial-10
 inkplate-dev frame --out /tmp/current.png
 inkplate-dev tap 400 300
 inkplate-dev repl
 ```
+
+Connection options work before or after the command. `status` aliases `state`;
+`capture` and `screen` alias `frame`; `-o` and `--output` alias `--out`.
 
 Or use the Python API:
 
@@ -157,7 +177,12 @@ with InkplateDevConsoleClient() as dev:
     print(capture.as_json())
 ```
 
-Port detection checks `INKPLATE_PORT`, then `UPLOAD_PORT`, then common macOS and Linux USB serial device names.
+Port detection checks `INKPLATE_PORT`, then `UPLOAD_PORT`, then common macOS
+and Linux USB serial device names. Version 0.2 makes the tool-specific
+`INKPLATE_PORT` override authoritative when both environment variables are set;
+use `--port` for the highest-priority one-off override.
+Use `inkplate-dev ports --json` to see the selected path, its provenance, and
+all candidates without opening the serial port.
 
 ## Commands
 
@@ -165,6 +190,9 @@ Port detection checks `INKPLATE_PORT`, then `UPLOAD_PORT`, then common macOS and
 | --- | --- |
 | `inkplate-dev state` | Print `DEV_STATE` JSON. |
 | `inkplate-dev frame --out screen.png` | Capture the framebuffer as `.png`, `.pbm`, or `.raw`. |
+| `inkplate-dev snapshot --out screen.png` | Read state and capture a frame through one serial connection. |
+| `inkplate-dev ports --json` | Show deterministic port selection and candidate metadata. |
+| `inkplate-dev doctor --connect --json` | Validate local setup and optionally request live device state. |
 | `inkplate-dev tap X Y` | Queue a synthetic tap at screen coordinates. |
 | `inkplate-dev square e2` | Queue a synthetic tap resolved by firmware's named-point callback. |
 | `inkplate-dev back` | Queue the firmware's `back` target, or `(30, 30)` if none is registered. |
@@ -173,6 +201,35 @@ Port detection checks `INKPLATE_PORT`, then `UPLOAD_PORT`, then common macOS and
 | `inkplate-dev awake on/off` | Toggle the firmware keep-awake flag. |
 | `inkplate-dev watch --out screen.png --interval 1` | Capture repeatedly. |
 | `inkplate-dev repl` | Open an interactive console. |
+| `inkplate-dev capabilities --json` | Print the stable command, schema, environment, and exit-code contract. |
+| `inkplate-dev robot-docs guide` | Print an embedded, agent-facing operating guide. |
+
+Run `inkplate-dev` with no arguments for high-signal help and fast paths.
+Run `inkplate-dev --version` to inspect the installed version.
+
+## Automation Contract
+
+- Standard command data and JSON go to stdout.
+- Firmware boot logs and diagnostics go to stderr.
+- `watch` emits one sorted JSON object per line (NDJSON).
+- `--json-errors` makes operational errors one deterministic JSON object on
+  stderr.
+- Exit codes are stable:
+
+| Exit | Meaning |
+| ---: | --- |
+| 0 | Success |
+| 2 | Invalid command, option, argument, or output path |
+| 3 | Local environment or serial-port opening failure |
+| 4 | Device timeout or protocol failure |
+| 5 | Unexpected internal failure |
+| 130 | Interrupted by the user |
+
+The full machine-readable contract is available offline:
+
+```bash
+inkplate-dev capabilities --json
+```
 
 ## Architecture
 
@@ -200,15 +257,23 @@ InkplateDevConsole Arduino library
 
 `No Inkplate USB serial port found`
 
-Set the port explicitly:
+Inspect selection, then set the port explicitly:
 
 ```bash
+inkplate-dev ports --json
 INKPLATE_PORT=/dev/cu.usbserial-10 inkplate-dev state
 ```
 
 `Timed out waiting for DEV_STATE`
 
 Confirm the firmware was compiled with the dev console enabled and that `devConsole.poll()` runs in `loop()`.
+
+Production firmware intentionally excludes the console. To distinguish that
+expected condition from a local serial problem:
+
+```bash
+inkplate-dev doctor --connect --json
+```
 
 The PNG looks horizontally scrambled in 8-pixel groups
 
@@ -217,6 +282,28 @@ The firmware likely reported the wrong frame format. Inkplate's 1-bit buffer sho
 Opening serial resets the board
 
 The CLI opens with DTR enabled and RTS disabled, which works for common ESP32 USB serial adapters. If your adapter behaves differently, open an issue with the adapter model and boot log.
+
+Another process owns the serial port
+
+Close PlatformIO monitors, terminal serial sessions, and other `inkplate-dev`
+processes, then retry the exact port reported by `ports`:
+
+```bash
+inkplate-dev doctor --connect --json --port /dev/cu.usbserial-10
+```
+
+## Development
+
+Create the locked development environment and run every local check:
+
+```bash
+uv sync --group dev
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy python
+uv run coverage run -m unittest discover -s tests
+uv build
+```
 
 ## Limitations
 

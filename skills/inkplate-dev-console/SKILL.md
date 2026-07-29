@@ -13,7 +13,8 @@ Prefer a project wrapper when one exists. In `eink.fun`, run from the repo root:
 
 ```bash
 bash scripts/device-console.sh state
-bash scripts/device-console.sh frame --out tmp/current.png
+bash scripts/device-console.sh snapshot --out tmp/current.png
+bash scripts/device-console.sh doctor --connect --json
 bash scripts/device-console.sh tap 420 260
 bash scripts/device-console.sh back
 bash scripts/device-console.sh repl
@@ -24,19 +25,25 @@ Without a wrapper, install/use the Python package:
 ```bash
 python3 -m pip install git+https://github.com/alexjamesgodfrey/inkplate-dev-console.git
 inkplate-dev state
-inkplate-dev frame --out /tmp/inkplate.png
+inkplate-dev snapshot --out /tmp/inkplate.png
 ```
 
 Use `INKPLATE_PORT=/dev/...` or `UPLOAD_PORT=/dev/...` when auto-detection picks the wrong serial device.
+Run `inkplate-dev ports --json` to inspect deterministic port selection.
 
 ## Hardware Loop
 
 1. Confirm the firmware is a dev build with the console enabled, usually `-DINKPLATE_DEV_CONSOLE=1`.
 2. Build/upload the firmware before relying on new callbacks.
-3. Run `state` and check `devSerialConsole: true`.
-4. Run `frame --out <path>.png`; inspect the generated image directly.
+3. Run `snapshot --out <path>.png` and check `state.devSerialConsole: true`.
+4. Inspect the generated image directly.
 5. Inject input with `tap x y`, `back`, or an app-defined target such as `square e2`.
-6. Re-run `state` and `frame` after each action until the physical display state matches the intended behavior.
+6. Re-run `snapshot` after each action until state and the physical display match.
+
+If a device command fails, run `doctor --connect --json`. Exit 3 means a local
+environment/port failure; exit 4 means the port opened but firmware timed out or
+returned invalid protocol data. Production firmware intentionally times out
+because the console is dev-only.
 
 For Codex desktop, display local captures with an absolute image path:
 
@@ -119,7 +126,7 @@ Inkplate 1-bit framebuffers normally use `1bpp-lsb-black1`: `1` means black, and
 
 For a completed hardware-debug task, gather concrete evidence:
 
-- `state` output showing the expected screen/app state.
-- A captured PNG that visually matches the physical screen.
+- `snapshot` output showing the expected screen/app state and captured path.
+- The captured PNG visually matching the physical screen.
 - ACK output for injected input.
 - A second state/frame capture proving the input changed the UI as expected.

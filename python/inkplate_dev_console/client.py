@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import glob
 import json
 import os
-from pathlib import Path
 import struct
 import sys
 import time
 import zlib
-from typing import Any, Iterable
-
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, NoReturn
 
 DEFAULT_BAUD = 115200
 DEFAULT_FRAME_PATH = Path("inkplate-frame.png")
@@ -26,6 +26,45 @@ PORT_GLOBS = (
 )
 
 
+class InkplateDevConsoleError(RuntimeError):
+    """Base class for expected operational failures."""
+
+
+class PortDetectionError(InkplateDevConsoleError):
+    """Raised when no serial port can be selected."""
+
+
+class SerialOpenError(InkplateDevConsoleError):
+    """Raised when pyserial cannot open the selected port."""
+
+
+class SerialConnectionError(InkplateDevConsoleError):
+    """Raised when an open serial connection fails during I/O."""
+
+
+class DeviceProtocolError(InkplateDevConsoleError):
+    """Raised when firmware returns malformed or unsupported protocol data."""
+
+
+class DeviceTimeoutError(TimeoutError, InkplateDevConsoleError):
+    """Raised when dev firmware does not answer before the deadline."""
+
+
+@dataclass(frozen=True)
+class PortCandidate:
+    path: str
+    source: str
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "exists": Path(self.path).exists(),
+            "path": self.path,
+            "readable": os.access(self.path, os.R_OK),
+            "source": self.source,
+            "writable": os.access(self.path, os.W_OK),
+        }
+
+
 @dataclass(frozen=True)
 class FrameCapture:
     width: int
@@ -36,15 +75,21 @@ class FrameCapture:
     path: Path
 
     @classmethod
-    def from_meta(cls, meta: dict[str, Any], path: Path) -> "FrameCapture":
-        return cls(
-            width=int(meta["width"]),
-            height=int(meta["height"]),
-            row_bytes=int(meta.get("rowBytes", (int(meta["width"]) + 7) // 8)),
-            byte_count=int(meta["bytes"]),
-            frame_format=str(meta.get("format", "1bpp-lsb-black1")),
-            path=path,
-        )
+    def from_meta(cls, meta: dict[str, Any], path: Path) -> FrameCapture:
+        try:
+            width = int(meta["width"])
+            return cls(
+                width=width,
+                height=int(meta["height"]),
+                row_bytes=int(meta.get("rowBytes", (width + 7) // 8)),
+                byte_count=int(meta["bytes"]),
+                frame_format=str(meta.get("format", "1bpp-lsb-black1")),
+                path=path,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DeviceProtocolError(
+                f"Invalid DEV_FRAME_BEGIN metadata: {meta}"
+            ) from exc
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -57,43 +102,118 @@ class FrameCapture:
         }
 
 
-def detect_port() -> str:
-    override = os.environ.get("UPLOAD_PORT") or os.environ.get("INKPLATE_PORT")
-    if override:
-        return override
+def list_port_candidates() -> list[PortCandidate]:
+    candidates: list[PortCandidate] = []
+    seen: set[str] = set()
+
+    for variable in ("INKPLATE_PORT", "UPLOAD_PORT"):
+        path = os.environ.get(variable)
+        if path and path not in seen:
+            candidates.append(PortCandidate(path=path, source=variable))
+            seen.add(path)
 
     for pattern in PORT_GLOBS:
-        matches = sorted(glob.glob(pattern))
-        if matches:
-            return matches[0]
+        for path in sorted(glob.glob(pattern)):
+            if path not in seen:
+                candidates.append(PortCandidate(path=path, source=f"auto:{pattern}"))
+                seen.add(path)
 
-    raise RuntimeError("No Inkplate USB serial port found. Set INKPLATE_PORT=/dev/... to override.")
+    return candidates
+
+
+def port_inventory(explicit_port: str | None = None) -> dict[str, Any]:
+    candidates = list_port_candidates()
+    selected: PortCandidate | None
+    if explicit_port:
+        selected = PortCandidate(path=explicit_port, source="--port")
+    else:
+        selected = candidates[0] if candidates else None
+
+    return {
+        "candidates": [candidate.as_json() for candidate in candidates],
+        "selected": selected.as_json() if selected else None,
+        "selectionOrder": ["--port", "INKPLATE_PORT", "UPLOAD_PORT", *PORT_GLOBS],
+    }
+
+
+def detect_port() -> str:
+    candidates = list_port_candidates()
+    if candidates:
+        return candidates[0].path
+
+    raise PortDetectionError(
+        "No Inkplate USB serial port found. "
+        "Next: connect the device or run `inkplate-dev ports --json`; "
+        "override with `INKPLATE_PORT=/dev/... inkplate-dev state`."
+    )
 
 
 def open_serial(port: str, baud: int):
-    import serial
+    try:
+        import serial  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise SerialOpenError(
+            "pyserial is not installed. Next: `python3 -m pip install pyserial`."
+        ) from exc
 
-    ser = serial.Serial()
-    ser.port = port
-    ser.baudrate = baud
-    ser.timeout = 0.25
-    ser.write_timeout = 2
-    ser.dtr = True
-    ser.rts = False
-    ser.open()
-    ser.dtr = True
-    ser.rts = False
-    time.sleep(0.15)
-    ser.reset_input_buffer()
-    return ser
+    try:
+        ser = serial.Serial()
+        ser.port = port
+        ser.baudrate = baud
+        ser.timeout = 0.25
+        ser.write_timeout = 2
+        ser.dtr = True
+        ser.rts = False
+        ser.open()  # ubs:ignore — pyserial lifecycle is closed by InkplateDevConsoleClient.close().
+        ser.dtr = True
+        ser.rts = False
+        time.sleep(0.15)
+        ser.reset_input_buffer()
+        return ser
+    except (OSError, serial.SerialException) as exc:
+        raise SerialOpenError(
+            f"Could not open Inkplate serial port {port!r}: {exc}. "
+            "Next: close other serial monitors, then run "
+            f"`inkplate-dev --port {port} doctor --connect --json`."
+        ) from exc
 
 
 def write_command(ser: Any, command: str) -> None:
     command = command.strip()
     if not command.startswith("dev:"):
         command = f"dev:{command}"
-    ser.write(f"{command}\n".encode("utf-8"))
-    ser.flush()
+    try:
+        ser.write(f"{command}\n".encode())
+        ser.flush()
+    except Exception as exc:  # noqa: BLE001 - pyserial is imported lazily; non-serial errors are re-raised.
+        raise_serial_connection_error(exc, f"sending {command!r}")
+
+
+def is_serial_error(exc: Exception) -> bool:
+    if isinstance(exc, OSError):
+        return True
+    try:
+        import serial  # type: ignore[import-untyped]
+    except ImportError:
+        return False
+    return isinstance(exc, serial.SerialException)
+
+
+def raise_serial_connection_error(exc: Exception, operation: str) -> NoReturn:
+    if not is_serial_error(exc):
+        raise exc
+    raise SerialConnectionError(
+        f"Serial connection failed while {operation}: {exc}. "
+        "Next: reconnect the device, close other serial monitors, then run "
+        "`inkplate-dev doctor --connect --json`."
+    ) from exc
+
+
+def read_serial_line(ser: Any) -> bytes:
+    try:
+        return ser.readline()
+    except Exception as exc:  # noqa: BLE001 - pyserial is imported lazily; non-serial errors are re-raised.
+        raise_serial_connection_error(exc, "reading from the device")
 
 
 def read_prefixed_line(
@@ -105,7 +225,7 @@ def read_prefixed_line(
 ) -> tuple[str, str]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        raw = ser.readline()
+        raw = read_serial_line(ser)
         if not raw:
             continue
 
@@ -117,21 +237,31 @@ def read_prefixed_line(
         if line and echo_unmatched:
             print(line, file=sys.stderr)
 
-        if retry_command and ("[INIT] Setup complete" in line or "[INIT] Resumed game" in line):
+        if retry_command and (
+            "[INIT] Setup complete" in line or "[INIT] Resumed game" in line
+        ):
             write_command(ser, retry_command)
             retry_command = None
             deadline = max(deadline, time.monotonic() + timeout)
 
-    raise TimeoutError(f"Timed out waiting for one of: {', '.join(prefixes)}")
+    expected = ", ".join(prefixes)
+    raise DeviceTimeoutError(
+        f"Timed out waiting for {expected}. The connected firmware may be asleep "
+        "or may be a production build without the dev console. "
+        "Next: flash a build with `-DINKPLATE_DEV_CONSOLE=1`, then run "
+        "`inkplate-dev doctor --connect --json`."
+    )
 
 
 def parse_json_object(payload: str, label: str) -> dict[str, Any]:
     try:
-        value = json.loads(payload)
+        value = json.loads(payload)  # ubs:ignore — guarded by JSONDecodeError below.
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid {label} JSON: {payload}") from exc
+        raise DeviceProtocolError(f"Invalid {label} JSON: {payload}") from exc
     if not isinstance(value, dict):
-        raise RuntimeError(f"Invalid {label} JSON: expected object, got {type(value).__name__}")
+        raise DeviceProtocolError(
+            f"Invalid {label} JSON: expected object, got {type(value).__name__}"
+        )
     return value
 
 
@@ -142,18 +272,26 @@ def read_json_prefix(
     retry_command: str | None = None,
     echo_unmatched: bool = True,
 ) -> dict[str, Any]:
-    _, payload = read_prefixed_line(ser, (prefix,), timeout, retry_command, echo_unmatched)
+    _, payload = read_prefixed_line(
+        ser, (prefix,), timeout, retry_command, echo_unmatched
+    )
     return parse_json_object(payload, prefix)
 
 
-def request_state(ser: Any, timeout: float = 30.0, echo_unmatched: bool = True) -> dict[str, Any]:
+def request_state(
+    ser: Any, timeout: float = 30.0, echo_unmatched: bool = True
+) -> dict[str, Any]:
     write_command(ser, "state")
     return read_json_prefix(ser, "DEV_STATE", timeout, "state", echo_unmatched)
 
 
-def request_ack(ser: Any, command: str, timeout: float = 30.0, echo_unmatched: bool = True) -> dict[str, Any]:
+def request_ack(
+    ser: Any, command: str, timeout: float = 30.0, echo_unmatched: bool = True
+) -> dict[str, Any]:
     write_command(ser, command)
-    prefix, payload = read_prefixed_line(ser, ("DEV_ACK", "DEV_HELP"), timeout, command, echo_unmatched)
+    prefix, payload = read_prefixed_line(
+        ser, ("DEV_ACK", "DEV_HELP"), timeout, command, echo_unmatched
+    )
     if prefix == "DEV_HELP":
         return {"ok": True, "help": payload}
     return parse_json_object(payload, prefix)
@@ -164,7 +302,7 @@ def normalize_frame_bits(raw_frame: bytes, frame_format: str) -> bytes:
         return raw_frame.translate(BIT_REVERSE)
     if frame_format == "1bpp-msb-black1":
         return raw_frame
-    raise RuntimeError(f"Unsupported frame format: {frame_format}")
+    raise DeviceProtocolError(f"Unsupported frame format: {frame_format}")
 
 
 def write_pbm(path: Path, width: int, height: int, packed_black1_msb: bytes) -> None:
@@ -175,14 +313,19 @@ def write_pbm(path: Path, width: int, height: int, packed_black1_msb: bytes) -> 
 def _png_chunk(tag: bytes, data: bytes) -> bytes:
     crc = zlib.crc32(tag)
     crc = zlib.crc32(data, crc)
-    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc & 0xFFFFFFFF)
+    return (
+        struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc & 0xFFFFFFFF)
+    )
 
 
 def write_png(path: Path, width: int, height: int, packed_black1_msb: bytes) -> None:
     row_bytes = (width + 7) // 8
     expected = row_bytes * height
     if len(packed_black1_msb) != expected:
-        raise RuntimeError(f"PNG frame length mismatch: got {len(packed_black1_msb)} bytes, expected {expected}")
+        raise DeviceProtocolError(
+            f"PNG frame length mismatch: got {len(packed_black1_msb)} bytes, "
+            f"expected {expected}"
+        )
 
     rows = bytearray()
     for row in range(height):
@@ -205,10 +348,15 @@ def write_png(path: Path, width: int, height: int, packed_black1_msb: bytes) -> 
     path.write_bytes(payload)
 
 
-def write_frame_output(path: Path, meta: dict[str, Any], raw_frame: bytes) -> FrameCapture:
+def write_frame_output(
+    path: Path, meta: dict[str, Any], raw_frame: bytes
+) -> FrameCapture:
     capture = FrameCapture.from_meta(meta, path)
     if len(raw_frame) != capture.byte_count:
-        raise RuntimeError(f"Frame length mismatch: got {len(raw_frame)} bytes, expected {capture.byte_count}")
+        raise DeviceProtocolError(
+            f"Frame length mismatch: got {len(raw_frame)} bytes, "
+            f"expected {capture.byte_count}"
+        )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     suffix = path.suffix.lower()
@@ -221,7 +369,10 @@ def write_frame_output(path: Path, meta: dict[str, Any], raw_frame: bytes) -> Fr
         elif suffix == ".png":
             write_png(path, capture.width, capture.height, packed)
         else:
-            raise RuntimeError("Frame output extension must be .png, .pbm, or .raw")
+            raise ValueError(
+                "Frame output extension must be .png, .pbm, or .raw. "
+                "Next: use `--out /tmp/inkplate.png`."
+            )
 
     return capture
 
@@ -232,14 +383,16 @@ def capture_frame(
     timeout: float = 40.0,
     echo_unmatched: bool = True,
 ) -> FrameCapture:
+    deadline = time.monotonic() + timeout
     write_command(ser, "frame")
-    _, payload = read_prefixed_line(ser, ("DEV_FRAME_BEGIN",), timeout, "frame", echo_unmatched)
+    _, payload = read_prefixed_line(
+        ser, ("DEV_FRAME_BEGIN",), timeout, "frame", echo_unmatched
+    )
     meta = parse_json_object(payload, "DEV_FRAME_BEGIN")
     chunks: list[str] = []
 
-    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        raw = ser.readline()
+        raw = read_serial_line(ser)
         if not raw:
             continue
         line = raw.decode("utf-8", errors="replace").strip()
@@ -253,9 +406,19 @@ def capture_frame(
         if line and echo_unmatched:
             print(line, file=sys.stderr)
     else:
-        raise TimeoutError("Timed out waiting for DEV_FRAME_END")
+        raise DeviceTimeoutError(
+            "Timed out waiting for DEV_FRAME_END. "
+            "Next: rerun with a larger `--timeout`, for example "
+            "`inkplate-dev frame --timeout 90 --out /tmp/inkplate.png`."
+        )
 
-    return write_frame_output(output, meta, bytes.fromhex("".join(chunks)))
+    try:
+        raw_frame = bytes.fromhex("".join(chunks))
+    except ValueError as exc:
+        raise DeviceProtocolError(
+            "DEV_FRAME contained invalid hexadecimal data"
+        ) from exc
+    return write_frame_output(output, meta, raw_frame)
 
 
 class InkplateDevConsoleClient:
@@ -272,21 +435,29 @@ class InkplateDevConsoleClient:
         self.echo_unmatched = echo_unmatched
         self._serial = None
 
-    def __enter__(self) -> "InkplateDevConsoleClient":
-        self.open()
+    def __enter__(self) -> InkplateDevConsoleClient:  # noqa: PYI034 - Python 3.10 lacks typing.Self.
+        self.open()  # ubs:ignore — opens serial, not a filesystem handle; __exit__ closes it.
         return self
 
-    def __exit__(self, *_: object) -> None:
-        self.close()
+    def __exit__(self, exc_type: object, *_: object) -> None:
+        try:
+            self.close()
+        except SerialConnectionError:
+            if exc_type is None:
+                raise
 
-    def open(self) -> None:
+    def open(self) -> None:  # ubs:ignore — serial lifecycle, not filesystem.
         if self._serial is None:
             self._serial = open_serial(self.port, self.baud)
 
     def close(self) -> None:
         if self._serial is not None:
-            self._serial.close()
+            serial_handle = self._serial
             self._serial = None
+            try:
+                serial_handle.close()
+            except Exception as exc:  # noqa: BLE001 - pyserial is imported lazily; non-serial errors are re-raised.
+                raise_serial_connection_error(exc, "closing the device")
 
     @property
     def serial(self):
@@ -300,8 +471,15 @@ class InkplateDevConsoleClient:
     def command(self, command: str) -> dict[str, Any]:
         return request_ack(self.serial, command, self.timeout, self.echo_unmatched)
 
-    def frame(self, output: Path = DEFAULT_FRAME_PATH, timeout: float | None = None) -> FrameCapture:
-        return capture_frame(self.serial, output, max(timeout or self.timeout, 40.0), self.echo_unmatched)
+    def frame(
+        self, output: Path = DEFAULT_FRAME_PATH, timeout: float | None = None
+    ) -> FrameCapture:
+        return capture_frame(
+            self.serial,
+            output,
+            self.timeout if timeout is None else timeout,
+            self.echo_unmatched,
+        )
 
     def tap(self, x: int, y: int) -> dict[str, Any]:
         return self.command(f"tap {x} {y}")
@@ -309,7 +487,9 @@ class InkplateDevConsoleClient:
     def square(self, square: str) -> dict[str, Any]:
         return self.command(f"square {square}")
 
-    def watch(self, output: Path, interval: float = 1.0, count: int | None = None) -> Iterable[FrameCapture]:
+    def watch(
+        self, output: Path, interval: float = 1.0, count: int | None = None
+    ) -> Iterable[FrameCapture]:
         index = 0
         while count is None or index < count:
             if "{}" in str(output):
