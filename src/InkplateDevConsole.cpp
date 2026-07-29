@@ -163,7 +163,12 @@ void InkplateDevConsole::handleCommand(String command) {
     return;
   }
 
-  printAck(*stream_, "unknown", false, command);
+  String commandName = lowered;
+  const int firstSpace = commandName.indexOf(' ');
+  if (firstSpace >= 0) {
+    commandName = commandName.substring(0, firstSpace);
+  }
+  printAck(*stream_, commandName, false, command);
 }
 
 void InkplateDevConsole::printState() {

@@ -18,6 +18,7 @@ from .client import (
     DeviceTimeoutError,
     InkplateDevConsoleClient,
     InkplateDevConsoleError,
+    OutputPathError,
     PortDetectionError,
     SerialConnectionError,
     SerialOpenError,
@@ -91,7 +92,13 @@ def package_version() -> str:
 
 
 def print_json(value: object) -> None:
-    print(json.dumps(value, indent=2, sort_keys=True))
+    try:
+        rendered = json.dumps(value, allow_nan=False, indent=2, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise DeviceProtocolError(
+            f"Result cannot be represented as strict JSON: {exc}"
+        ) from exc
+    print(rendered)
 
 
 def capture_to_json(
@@ -453,7 +460,12 @@ def doctor_payload(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             ) as client:
                 report["deviceState"] = client.state()
                 report["health"] = "device-ready"
-        except (PortDetectionError, SerialOpenError, SerialConnectionError) as exc:
+        except (
+            PortDetectionError,
+            SerialOpenError,
+            SerialConnectionError,
+            OutputPathError,
+        ) as exc:
             report["error"] = str(exc)
             report["health"] = "environment-error"
             report["recommendedAction"] = next_action(
@@ -467,8 +479,10 @@ def doctor_payload(args: argparse.Namespace) -> tuple[dict[str, object], int]:
         ) as exc:
             report["error"] = str(exc)
             report["health"] = "device-error"
-            report["recommendedAction"] = (
-                "Flash dev firmware with -DINKPLATE_DEV_CONSOLE=1, then retry this command."
+            report["recommendedAction"] = next_action(
+                exc,
+                "Flash dev firmware with -DINKPLATE_DEV_CONSOLE=1, "
+                "then retry this command.",
             )
             return report, EXIT_CODES["device"]
 
@@ -613,7 +627,12 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         emit_error("usage", str(exc), EXIT_CODES["usage"], args.json_errors)
         return EXIT_CODES["usage"]
-    except (PortDetectionError, SerialOpenError, SerialConnectionError) as exc:
+    except (
+        PortDetectionError,
+        SerialOpenError,
+        SerialConnectionError,
+        OutputPathError,
+    ) as exc:
         emit_error("environment", str(exc), EXIT_CODES["environment"], args.json_errors)
         return EXIT_CODES["environment"]
     except (DeviceTimeoutError, DeviceProtocolError, InkplateDevConsoleError) as exc:

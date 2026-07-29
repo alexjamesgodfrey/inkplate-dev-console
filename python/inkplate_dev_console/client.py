@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import struct
 import sys
 import time
@@ -15,6 +16,8 @@ from typing import Any, NoReturn
 DEFAULT_BAUD = 115200
 DEFAULT_FRAME_PATH = Path("inkplate-frame.png")
 HEX_CHARS = frozenset("0123456789abcdefABCDEF")
+MAX_FRAME_DIMENSION = 8192
+MAX_FRAME_BYTES = 64 * 1024 * 1024
 BIT_REVERSE = bytes(int(f"{value:08b}"[::-1], 2) for value in range(256))
 PORT_GLOBS = (
     "/dev/cu.usbserial*",
@@ -40,6 +43,10 @@ class SerialOpenError(InkplateDevConsoleError):
 
 class SerialConnectionError(InkplateDevConsoleError):
     """Raised when an open serial connection fails during I/O."""
+
+
+class OutputPathError(InkplateDevConsoleError):
+    """Raised when a requested output artifact cannot be written."""
 
 
 class DeviceProtocolError(InkplateDevConsoleError):
@@ -73,23 +80,46 @@ class FrameCapture:
     byte_count: int
     frame_format: str
     path: Path
+    encoding: str = "hex"
 
     @classmethod
     def from_meta(cls, meta: dict[str, Any], path: Path) -> FrameCapture:
         try:
-            width = int(meta["width"])
-            return cls(
-                width=width,
-                height=int(meta["height"]),
-                row_bytes=int(meta.get("rowBytes", (width + 7) // 8)),
-                byte_count=int(meta["bytes"]),
-                frame_format=str(meta.get("format", "1bpp-lsb-black1")),
-                path=path,
-            )
+            width = protocol_int(meta["width"], "width")
+            height = protocol_int(meta["height"], "height")
+            row_bytes = protocol_int(meta.get("rowBytes", (width + 7) // 8), "rowBytes")
+            byte_count = protocol_int(meta["bytes"], "bytes")
+            frame_format = str(meta.get("format", "1bpp-lsb-black1"))
+            encoding = str(meta.get("encoding", "hex"))
         except (KeyError, TypeError, ValueError) as exc:
             raise DeviceProtocolError(
                 f"Invalid DEV_FRAME_BEGIN metadata: {meta}"
             ) from exc
+        expected_row_bytes = (width + 7) // 8
+        expected_byte_count = row_bytes * height
+        if (
+            not 0 < width <= MAX_FRAME_DIMENSION
+            or not 0 < height <= MAX_FRAME_DIMENSION
+            or row_bytes < expected_row_bytes
+            or byte_count != expected_byte_count
+            or byte_count > MAX_FRAME_BYTES
+            or frame_format not in {"1bpp-lsb-black1", "1bpp-msb-black1"}
+            or encoding != "hex"
+        ):
+            raise DeviceProtocolError(
+                "Invalid DEV_FRAME_BEGIN geometry, encoding, or format: "
+                f"width={width}, height={height}, rowBytes={row_bytes}, "
+                f"bytes={byte_count}, encoding={encoding!r}, format={frame_format!r}"
+            )
+        return cls(
+            width=width,
+            height=height,
+            row_bytes=row_bytes,
+            byte_count=byte_count,
+            frame_format=frame_format,
+            path=path,
+            encoding=encoding,
+        )
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -99,6 +129,7 @@ class FrameCapture:
             "bytes": self.byte_count,
             "format": self.frame_format,
             "path": str(self.path),
+            "encoding": self.encoding,
         }
 
 
@@ -119,6 +150,16 @@ def list_port_candidates() -> list[PortCandidate]:
                 seen.add(path)
 
     return candidates
+
+
+def protocol_int(value: object, label: str) -> int:
+    if isinstance(value, bool):
+        raise TypeError(f"{label} must be an integer")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"-?[0-9]+", value):
+        return int(value)
+    raise TypeError(f"{label} must be an integer")
 
 
 def port_inventory(explicit_port: str | None = None) -> dict[str, Any]:
@@ -156,6 +197,7 @@ def open_serial(port: str, baud: int):
             "pyserial is not installed. Next: `python3 -m pip install pyserial`."
         ) from exc
 
+    ser = None
     try:
         ser = serial.Serial()
         ser.port = port
@@ -171,6 +213,11 @@ def open_serial(port: str, baud: int):
         ser.reset_input_buffer()
         return ser
     except (OSError, serial.SerialException) as exc:
+        if ser is not None and getattr(ser, "is_open", False):
+            try:
+                ser.close()
+            except (OSError, serial.SerialException):
+                pass
         raise SerialOpenError(
             f"Could not open Inkplate serial port {port!r}: {exc}. "
             "Next: close other serial monitors, then run "
@@ -222,7 +269,7 @@ def read_prefixed_line(
     timeout: float,
     retry_command: str | None = None,
     echo_unmatched: bool = True,
-) -> tuple[str, str]:
+) -> tuple[str, str, float]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         raw = read_serial_line(ser)
@@ -232,7 +279,7 @@ def read_prefixed_line(
         line = raw.decode("utf-8", errors="replace").strip()
         for prefix in prefixes:
             if line.startswith(prefix):
-                return prefix, line[len(prefix) :].strip()
+                return prefix, line[len(prefix) :].strip(), deadline
 
         if line and echo_unmatched:
             print(line, file=sys.stderr)
@@ -254,9 +301,14 @@ def read_prefixed_line(
 
 
 def parse_json_object(payload: str, label: str) -> dict[str, Any]:
+    def reject_nonfinite(value: str) -> NoReturn:
+        raise ValueError(f"non-finite number {value}")
+
     try:
-        value = json.loads(payload)  # ubs:ignore — guarded by JSONDecodeError below.
-    except json.JSONDecodeError as exc:
+        value = json.loads(  # ubs:ignore — guarded by JSONDecodeError/ValueError below.
+            payload, parse_constant=reject_nonfinite
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
         raise DeviceProtocolError(f"Invalid {label} JSON: {payload}") from exc
     if not isinstance(value, dict):
         raise DeviceProtocolError(
@@ -272,7 +324,7 @@ def read_json_prefix(
     retry_command: str | None = None,
     echo_unmatched: bool = True,
 ) -> dict[str, Any]:
-    _, payload = read_prefixed_line(
+    _, payload, _ = read_prefixed_line(
         ser, (prefix,), timeout, retry_command, echo_unmatched
     )
     return parse_json_object(payload, prefix)
@@ -282,19 +334,76 @@ def request_state(
     ser: Any, timeout: float = 30.0, echo_unmatched: bool = True
 ) -> dict[str, Any]:
     write_command(ser, "state")
-    return read_json_prefix(ser, "DEV_STATE", timeout, "state", echo_unmatched)
+    prefix, payload, _ = read_prefixed_line(
+        ser, ("DEV_STATE", "DEV_ACK"), timeout, "state", echo_unmatched
+    )
+    if prefix == "DEV_ACK":
+        reject_unexpected_ack(payload, "state")
+    return parse_json_object(payload, prefix)
+
+
+def parse_correlated_ack(payload: str, expected_command: str) -> dict[str, Any]:
+    ack = parse_json_object(payload, "DEV_ACK")
+    if not isinstance(ack.get("ok"), bool):
+        raise DeviceProtocolError(
+            "DEV_ACK must contain boolean field `ok`. "
+            "Next: verify the firmware and CLI protocol versions match."
+        )
+    actual_command = ack.get("command")
+    message = ack.get("message")
+    message_parts = message.split(maxsplit=1) if isinstance(message, str) else []
+    legacy_unknown_rejection = (
+        actual_command == "unknown"
+        and not ack["ok"]
+        and bool(message_parts)
+        and message_parts[0].lower() == expected_command
+    )
+    if (
+        not isinstance(actual_command, str)
+        or actual_command != expected_command
+        and not legacy_unknown_rejection
+    ):
+        raise DeviceProtocolError(
+            f"DEV_ACK command mismatch: expected {expected_command!r}, "
+            f"got {actual_command!r}. Next: flush stale serial responses and retry."
+        )
+    return ack
+
+
+def reject_unexpected_ack(payload: str, expected_command: str) -> NoReturn:
+    ack = parse_correlated_ack(payload, expected_command)
+    message = ack.get("message")
+    if not ack["ok"]:
+        suffix = f": {message}" if isinstance(message, str) and message else ""
+        raise DeviceProtocolError(
+            f"Device rejected {expected_command!r}{suffix}. "
+            "Next: verify the corresponding firmware callback is configured."
+        )
+    raise DeviceProtocolError(
+        f"Unexpected positive DEV_ACK for {expected_command!r}; "
+        "expected command data. Next: flush stale serial responses and retry."
+    )
 
 
 def request_ack(
     ser: Any, command: str, timeout: float = 30.0, echo_unmatched: bool = True
 ) -> dict[str, Any]:
+    normalized_command = command.strip()
+    if normalized_command.startswith("dev:"):
+        normalized_command = normalized_command[4:].lstrip()
+    if not normalized_command:
+        raise ValueError("Device command cannot be empty")
     write_command(ser, command)
-    prefix, payload = read_prefixed_line(
-        ser, ("DEV_ACK", "DEV_HELP"), timeout, command, echo_unmatched
+    expected_command = normalized_command.split(maxsplit=1)[0].lower()
+    if expected_command == "?":
+        expected_command = "help"
+    prefixes = ("DEV_HELP",) if expected_command == "help" else ("DEV_ACK",)
+    prefix, payload, _ = read_prefixed_line(
+        ser, prefixes, timeout, command, echo_unmatched
     )
     if prefix == "DEV_HELP":
         return {"ok": True, "help": payload}
-    return parse_json_object(payload, prefix)
+    return parse_correlated_ack(payload, expected_command)
 
 
 def normalize_frame_bits(raw_frame: bytes, frame_format: str) -> bytes:
@@ -305,9 +414,22 @@ def normalize_frame_bits(raw_frame: bytes, frame_format: str) -> bytes:
     raise DeviceProtocolError(f"Unsupported frame format: {frame_format}")
 
 
+def compact_frame_rows(frame: bytes, width: int, height: int, row_bytes: int) -> bytes:
+    packed_row_bytes = (width + 7) // 8
+    if row_bytes == packed_row_bytes:
+        return frame
+    return b"".join(
+        frame[row * row_bytes : row * row_bytes + packed_row_bytes]
+        for row in range(height)
+    )
+
+
 def write_pbm(path: Path, width: int, height: int, packed_black1_msb: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(f"P4\n{width} {height}\n".encode("ascii") + packed_black1_msb)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"P4\n{width} {height}\n".encode("ascii") + packed_black1_msb)
+    except OSError as exc:
+        raise_output_path_error(path, exc)
 
 
 def _png_chunk(tag: bytes, data: bytes) -> bytes:
@@ -344,8 +466,18 @@ def write_png(path: Path, width: int, height: int, packed_black1_msb: bytes) -> 
         + _png_chunk(b"IEND", b"")
     )
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(payload)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    except OSError as exc:
+        raise_output_path_error(path, exc)
+
+
+def raise_output_path_error(path: Path, exc: OSError) -> NoReturn:
+    raise OutputPathError(
+        f"Could not write frame output {str(path)!r}: {exc}. "
+        "Next: choose a writable path with `--out /tmp/inkplate.png`."
+    ) from exc
 
 
 def write_frame_output(
@@ -358,12 +490,18 @@ def write_frame_output(
             f"expected {capture.byte_count}"
         )
 
-    path.parent.mkdir(parents=True, exist_ok=True)
     suffix = path.suffix.lower()
     if suffix == ".raw":
-        path.write_bytes(raw_frame)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw_frame)
+        except OSError as exc:
+            raise_output_path_error(path, exc)
     else:
         packed = normalize_frame_bits(raw_frame, capture.frame_format)
+        packed = compact_frame_rows(
+            packed, capture.width, capture.height, capture.row_bytes
+        )
         if suffix == ".pbm":
             write_pbm(path, capture.width, capture.height, packed)
         elif suffix == ".png":
@@ -385,11 +523,15 @@ def capture_frame(
 ) -> FrameCapture:
     deadline = time.monotonic() + timeout
     write_command(ser, "frame")
-    _, payload = read_prefixed_line(
-        ser, ("DEV_FRAME_BEGIN",), timeout, "frame", echo_unmatched
+    prefix, payload, deadline = read_prefixed_line(
+        ser, ("DEV_FRAME_BEGIN", "DEV_ACK"), timeout, "frame", echo_unmatched
     )
+    if prefix == "DEV_ACK":
+        reject_unexpected_ack(payload, "frame")
     meta = parse_json_object(payload, "DEV_FRAME_BEGIN")
+    expected_capture = FrameCapture.from_meta(meta, output)
     chunks: list[str] = []
+    hex_char_count = 0
 
     while time.monotonic() < deadline:
         raw = read_serial_line(ser)
@@ -399,9 +541,22 @@ def capture_frame(
         if line == "DEV_FRAME_END":
             break
         if line.startswith("DEV_FRAME "):
-            payload = "".join(ch for ch in line[len("DEV_FRAME ") :] if ch in HEX_CHARS)
-            if payload:
-                chunks.append(payload)
+            payload = "".join(line[len("DEV_FRAME ") :].split())
+            if (
+                not payload
+                or len(payload) % 2 != 0
+                or any(ch not in HEX_CHARS for ch in payload)
+            ):
+                raise DeviceProtocolError(
+                    "DEV_FRAME contained invalid hexadecimal data"
+                )
+            hex_char_count += len(payload)
+            if hex_char_count > expected_capture.byte_count * 2:
+                raise DeviceProtocolError(
+                    "DEV_FRAME payload exceeds the byte count declared by "
+                    "DEV_FRAME_BEGIN"
+                )
+            chunks.append(payload)
             continue
         if line and echo_unmatched:
             print(line, file=sys.stderr)

@@ -20,7 +20,7 @@ inkplate-dev state
 inkplate-dev frame --out /tmp/inkplate.png
 inkplate-dev tap 420 260
 inkplate-dev square e2
-inkplate-dev watch --out /tmp/inkplate.png --interval 1
+inkplate-dev watch --out '/tmp/inkplate-{}.png' --interval 1
 ```
 
 For the common agent loop, one command reads state and captures the screen
@@ -199,7 +199,7 @@ all candidates without opening the serial port.
 | `inkplate-dev refresh` | Send an app-specific `refresh` command if firmware implements it. |
 | `inkplate-dev bench` | Send an app-specific `bench` command if firmware implements it. |
 | `inkplate-dev awake on/off` | Toggle the firmware keep-awake flag. |
-| `inkplate-dev watch --out screen.png --interval 1` | Capture repeatedly. |
+| `inkplate-dev watch --out 'screen-{}.png' --interval 1` | Capture repeatedly with `{}` replaced by the zero-based index. |
 | `inkplate-dev repl` | Open an interactive console. |
 | `inkplate-dev capabilities --json` | Print the stable command, schema, environment, and exit-code contract. |
 | `inkplate-dev robot-docs guide` | Print an embedded, agent-facing operating guide. |

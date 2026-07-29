@@ -1,13 +1,17 @@
 import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from inkplate_dev_console.client import (
     PortDetectionError,
+    SerialOpenError,
     detect_port,
     list_port_candidates,
+    open_serial,
     port_inventory,
 )
 
@@ -77,6 +81,25 @@ class PortDiscoveryTests(unittest.TestCase):
         self.assertEqual(inventory["selected"]["path"], path)
         self.assertEqual(inventory["selected"]["source"], "--port")
         self.assertEqual(inventory["selectionOrder"][0], "--port")
+
+    def test_partially_opened_serial_handle_is_closed_on_setup_failure(self) -> None:
+        class FakeSerialException(Exception):
+            pass
+
+        handle = Mock()
+        handle.is_open = True
+        handle.reset_input_buffer.side_effect = FakeSerialException("reset failed")
+        serial_module = types.SimpleNamespace(
+            Serial=Mock(return_value=handle),
+            SerialException=FakeSerialException,
+        )
+        with (
+            patch.dict(sys.modules, {"serial": serial_module}),
+            patch("inkplate_dev_console.client.time.sleep"),
+            self.assertRaises(SerialOpenError),
+        ):
+            open_serial("/dev/example", 115200)
+        handle.close.assert_called_once_with()
 
 
 if __name__ == "__main__":
